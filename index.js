@@ -4,6 +4,7 @@ import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 import axios from 'axios';
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const GUILD_ID = process.env.GUILD_ID;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const LOCAL = process.env.LOCAL === 'true';
 const AI_MODEL = process.env.AI_MODEL;
@@ -11,6 +12,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const RANDOM_RESPONSE_CHANCE = parseFloat(process.env.RANDOM_RESPONSE_CHANCE || '0.1');
 const PROMPT = process.env.PROMPT || '';
 const DEBUG = process.env.DEBUG === 'true';
+const ENABLE_MENTIONS = process.env.ENABLE_MENTIONS === 'true';
 
 const START_TIME = Date.now();
 let conversationMemory = [];
@@ -18,7 +20,12 @@ let lastResponseTime = 0;
 
 // === Initialize Discord Client ===
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMessageReactions
+    ]
 });
 
 // === AI Response Function ===
@@ -83,16 +90,29 @@ client.once('ready', () => {
 });
 
 client.on('messageCreate', async (message) => {
-    if (message.author.bot || message.channel.id !== CHANNEL_ID) return;
+    if (message.author.bot) return;
+
+    // Channel restriction logic
+    const isCorrectChannel = message.channel.id === CHANNEL_ID;
+    const isMentioned = message.mentions.has(client.user);
+    const isGuildChannel = message.guild?.id === GUILD_ID;
+
+    // Skip if not in correct channel and not a mention (when mentions are enabled)
+    if (!isCorrectChannel && !(ENABLE_MENTIONS && isMentioned && isGuildChannel)) return;
 
     const currentTime = Date.now();
     let shouldRespond = false;
 
-    if (message.mentions.has(client.user)) {
+    if (isMentioned && ENABLE_MENTIONS && isGuildChannel) {
         shouldRespond = true;
-    } else if (Math.random() < RANDOM_RESPONSE_CHANCE && currentTime - lastResponseTime > 10000) {
-        shouldRespond = true;
-        lastResponseTime = currentTime;
+    } else if (isCorrectChannel) {
+        // Original logic for specific channel
+        if (isMentioned) {
+            shouldRespond = true;
+        } else if (Math.random() < RANDOM_RESPONSE_CHANCE && currentTime - lastResponseTime > 10000) {
+            shouldRespond = true;
+            lastResponseTime = currentTime;
+        }
     }
 
     if (shouldRespond) {
@@ -131,7 +151,14 @@ client.on('messageCreate', async (message) => {
 
 // === Info Command ===
 client.on('messageCreate', async (message) => {
-    if (message.content.toLowerCase() === '!info' && message.channel.id === CHANNEL_ID) {
+    if (message.author.bot) return;
+    
+    const isCorrectChannel = message.channel.id === CHANNEL_ID;
+    const isMentioned = message.mentions.has(client.user);
+    const isGuildChannel = message.guild?.id === GUILD_ID;
+    
+    if (message.content.toLowerCase() === '!info' &&
+        (isCorrectChannel || (ENABLE_MENTIONS && isMentioned && isGuildChannel))) {
         const uptime = Date.now() - START_TIME;
         const hours = Math.floor(uptime / 3600000);
         const minutes = Math.floor((uptime % 3600000) / 60000);
@@ -142,7 +169,8 @@ client.on('messageCreate', async (message) => {
             .setColor(0x00ff00)
             .addFields(
                 { name: 'Model', value: AI_MODEL, inline: true },
-                { name: 'Uptime', value: `${hours}h ${minutes}m ${seconds}s` }
+                { name: 'Uptime', value: `${hours}h ${minutes}m ${seconds}s` },
+                { name: 'Mentions Enabled', value: ENABLE_MENTIONS ? 'Yes' : 'No', inline: true }
             );
 
         message.channel.send({ embeds: [embed] });
