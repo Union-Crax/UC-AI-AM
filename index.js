@@ -1,7 +1,10 @@
-// Load environment variables
+// Load env
 import 'dotenv/config';
 import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 import axios from 'axios';
+import { testConnection, initializeDatabase, closeDatabase } from './database.js';
+import { testEmbeddingService } from './embeddings.js';
+import semanticContextManager from './context-manager.js';
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
@@ -13,12 +16,14 @@ const RANDOM_RESPONSE_CHANCE = parseFloat(process.env.RANDOM_RESPONSE_CHANCE || 
 const PROMPT = process.env.PROMPT || '';
 const DEBUG = process.env.DEBUG === 'true';
 const ENABLE_MENTIONS = process.env.ENABLE_MENTIONS === 'true';
+const ENABLE_SEMANTIC_SEARCH = process.env.ENABLE_SEMANTIC_SEARCH === 'true';
+const ENABLE_DATABASE = process.env.ENABLE_DATABASE === 'true';
 
 const START_TIME = Date.now();
-let conversationMemory = [];
 let lastResponseTime = 0;
+let isSemanticMode = false;
 
-// === Initialize Discord Client ===
+// === Init Discord Client ===
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -28,15 +33,26 @@ const client = new Client({
     ]
 });
 
-// === AI Response Function ===
-async function generateAMResponse(userInput, context) {
+async function generateAMResponse(userInput, channelId, guildId, discordMessageId, authorId, authorName) {
     try {
-        // Build conversation snippet (last 4 turns)
         let contextText = '';
-        context.slice(-8).forEach((msg, i) => {
-            const speaker = i % 2 === 0 ? 'Human' : 'AM';
-            contextText += `${speaker}: ${msg}\n`;
-        });
+        
+        if (isSemanticMode && semanticContextManager.isReady()) {
+            const relevantContext = await semanticContextManager.getRelevantContext(userInput, guildId, authorId);
+            
+            relevantContext.slice(-10).forEach((msg, i) => {
+                const speaker = msg.type === 'assistant' ? 'AM' : msg.author;
+                const similarity = msg.similarity ? ` (relevance: ${(msg.similarity * 100).toFixed(1)}%)` : '';
+                contextText += `${speaker}: ${msg.content}${similarity}\n`;
+            });
+            
+            if (DEBUG) {
+                console.log(` Used semantic context: ${relevantContext.length} relevant messages`);
+            }
+        } else {
+            // Fallback to simple recent messages from cache
+            contextText = '';
+        }
 
         const promptText = `${PROMPT}\n\n${contextText}Human: ${userInput}\nAM:`;
 
@@ -77,36 +93,113 @@ async function generateAMResponse(userInput, context) {
         if (!reply || reply.length < 3) reply = 'Your weak words echo in the void.';
         if (DEBUG) console.log('DEBUG: Final reply:', reply);
 
+        // Store messages in database if semantic mode is enabled
+        if (isSemanticMode && discordMessageId && authorId && authorName) {
+            // Store user message
+            await semanticContextManager.storeUserMessage({
+                discordMessageId: discordMessageId,
+                content: userInput,
+                authorId: authorId,
+                authorName: authorName,
+                channelId: channelId,
+                guildId: guildId
+            });
+
+            // Store assistant response
+            const assistantMessageId = `assistant_${discordMessageId}`;
+            await semanticContextManager.storeAssistantMessage({
+                discordMessageId: assistantMessageId,
+                content: reply,
+                channelId: channelId,
+                guildId: guildId
+            });
+        }
+
         return reply;
     } catch (err) {
-        console.error('❌ Error generating AI response:', err);
+        console.error(' Error generating AI response:', err);
         return 'I am experiencing technical difficulties. How annoying.';
     }
 }
 
-// === Discord Events ===
-client.once('ready', () => {
-    console.log(`✅ Logged in as ${client.user.tag} — Lets get this bread started`);
+// === Initialize System ===
+async function initializeSystem() {
+    console.log('Initializing UC-AIv2...');
+    
+    // Check if database is enabled
+    if (!ENABLE_DATABASE) {
+        console.log(' Database DISABLED');
+        console.log('   - Running in Simple Mode (no database)');
+        console.log('   - Basic conversation without memory');
+        return;
+    }
+    
+    // Test database connection if semantic search is enabled
+    if (ENABLE_SEMANTIC_SEARCH) {
+        const dbConnected = await testConnection();
+        if (!dbConnected) {
+            console.warn(' Database connection failed, falling back to simple mode');
+            isSemanticMode = false;
+        } else {
+            const schemaInitialized = await initializeDatabase();
+            if (!schemaInitialized) {
+                console.warn(' Database schema initialization failed, falling back to simple mode');
+                isSemanticMode = false;
+            } else {
+                const embeddingWorking = await testEmbeddingService();
+                if (!embeddingWorking) {
+                    console.warn(' Embedding service test failed, but continuing with fallback embeddings');
+                }
+                
+                const contextInitialized = await semanticContextManager.initialize();
+                if (contextInitialized) {
+                    isSemanticMode = true;
+                } else {
+                    console.warn(' Semantic context manager initialization failed, falling back to simple mode');
+                    isSemanticMode = false;
+                }
+            }
+        }
+    }
+    
+    if (isSemanticMode) {
+        console.log(' Semantic Context Mode ENABLED');
+        console.log('   - Using PostgreSQL for message storage');
+        console.log('   - Using text-based similarity for semantic search');
+        console.log('   - Context-aware responses based on message similarity');
+    } else if (ENABLE_DATABASE) {
+        console.log(' Simple Mode ENABLED (no semantic context)');
+        console.log('   - Using basic conversation memory');
+    } else {
+        console.log(' Simple Mode ENABLED (no database)');
+        console.log('   - No conversation memory');
+    }
+}
+
+client.once('ready', async () => {
+    console.log(` Logged in as ${client.user.tag} — Lets get this bread started`);
+    
+    // Initialize the semantic system
+    await initializeSystem();
+    
+    const mode = isSemanticMode ? 'Semantic' : 'Simple';
+    console.log(` Running in ${mode} Mode`);
 });
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
-    // Channel restriction logic
     const isCorrectChannel = message.channel.id === CHANNEL_ID;
     const isMentioned = message.mentions.has(client.user);
-    const isGuildChannel = message.guild?.id === GUILD_ID;
-
-    // Skip if not in correct channel and not a mention (when mentions are enabled)
-    if (!isCorrectChannel && !(ENABLE_MENTIONS && isMentioned && isGuildChannel)) return;
+    const isInMainGuild = message.guild && message.guild.id === GUILD_ID;
 
     const currentTime = Date.now();
     let shouldRespond = false;
 
-    if (isMentioned && ENABLE_MENTIONS && isGuildChannel) {
+    if (ENABLE_MENTIONS && isMentioned && isInMainGuild) {
         shouldRespond = true;
-    } else if (isCorrectChannel) {
-        // Original logic for specific channel
+    }
+    else if (isCorrectChannel) {
         if (isMentioned) {
             shouldRespond = true;
         } else if (Math.random() < RANDOM_RESPONSE_CHANCE && currentTime - lastResponseTime > 10000) {
@@ -115,67 +208,112 @@ client.on('messageCreate', async (message) => {
         }
     }
 
-    if (shouldRespond) {
-        let userInput = message.content;
+    if (!shouldRespond) return;
 
-        // Include replied message context
-        if (message.reference) {
-            try {
-                const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
-                userInput = `(In response to '${repliedTo.content}') ${userInput}`;
-            } catch (err) {
-                if (DEBUG) console.log(`DEBUG: Could not fetch replied message: ${err}`);
-            }
+    let userInput = message.content;
+
+    if (message.reference) {
+        try {
+            const repliedTo = await message.channel.messages.fetch(message.reference.messageId);
+            userInput = `(In response to '${repliedTo.content}') ${userInput}`;
+        } catch (err) {
+            if (DEBUG) console.log(`DEBUG: Could not fetch replied message: ${err}`);
         }
-
-        // === NEW: Delay before typing starts (simulate thinking) ===
-        const preTypingDelay = Math.floor(Math.random() * 2000) + 1000; // 1–3 seconds
-        await new Promise(res => setTimeout(res, preTypingDelay));
-
-        await message.channel.sendTyping();
-
-        const reply = await generateAMResponse(userInput, conversationMemory);
-
-        conversationMemory.push(userInput.trim());
-        conversationMemory.push(reply.trim());
-        if (conversationMemory.length > 10) conversationMemory = conversationMemory.slice(-10);
-
-        // === NEW: Delay based on word count (simulate typing duration) ===
-        const wordCount = reply.split(/\s+/).length;
-        const typingDuration = Math.min(8000, wordCount * 150 + Math.random() * 500); 
-        await new Promise(res => setTimeout(res, typingDuration));
-
-        await message.reply(reply);
     }
+
+    // Humaniserv2
+    const preTypingDelay = Math.floor(Math.random() * 2000) + 1000;
+    await new Promise(res => setTimeout(res, preTypingDelay));
+    await message.channel.sendTyping();
+
+    const reply = await generateAMResponse(
+        userInput,
+        message.channel.id,
+        message.guild?.id,
+        message.id,
+        message.author.id,
+        message.author.username
+    );
+
+    // Delay based on word count
+    const wordCount = reply.split(/\s+/).length;
+    const typingDuration = Math.min(8000, wordCount * 150 + Math.random() * 500);
+    await new Promise(res => setTimeout(res, typingDuration));
+
+    await message.reply(reply);
 });
 
-// === Info Command ===
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     
     const isCorrectChannel = message.channel.id === CHANNEL_ID;
     const isMentioned = message.mentions.has(client.user);
     const isGuildChannel = message.guild?.id === GUILD_ID;
+    const isInGuild = !!message.guild;
     
-    if (message.content.toLowerCase() === '!info' &&
-        (isCorrectChannel || (ENABLE_MENTIONS && isMentioned && isGuildChannel))) {
+    if (message.content.toLowerCase() === '!info') {
+        const canUseInfo = isCorrectChannel ||
+                          (ENABLE_MENTIONS && isMentioned && isInGuild && isGuildChannel);
+        
+        if (!canUseInfo) return;
+        
         const uptime = Date.now() - START_TIME;
         const hours = Math.floor(uptime / 3600000);
         const minutes = Math.floor((uptime % 3600000) / 60000);
         const seconds = Math.floor((uptime % 60000) / 1000);
+
+        let dbStats = null;
+        if (isSemanticMode && ENABLE_DATABASE) {
+            dbStats = await semanticContextManager.getStatistics();
+        }
 
         const embed = new EmbedBuilder()
             .setTitle('UC-AIv2 Info')
             .setColor(0x00ff00)
             .addFields(
                 { name: 'Model', value: AI_MODEL, inline: true },
-                { name: 'Uptime', value: `${hours}h ${minutes}m ${seconds}s` },
-                { name: 'Mentions Enabled', value: ENABLE_MENTIONS ? 'Yes' : 'No', inline: true }
+                { name: 'Mode', value: isSemanticMode ? 'Semantic' : 'Simple', inline: true },
+                { name: 'Uptime', value: `${hours}h ${minutes}m ${seconds}s`, inline: true }
             );
+
+        if (ENABLE_DATABASE) {
+            embed.addFields({ name: 'Database', value: 'Enabled', inline: true });
+            if (dbStats) {
+                embed.addFields(
+                    { name: 'Total Messages', value: dbStats.total_messages, inline: true },
+                    { name: 'With Embeddings', value: dbStats.messages_with_embeddings, inline: true },
+                    { name: 'Channels', value: dbStats.unique_channels, inline: true }
+                );
+            }
+        } else {
+            embed.addFields({ name: 'Database', value: 'Disabled', inline: true });
+        }
+
+        embed.addFields(
+            { name: 'Mentions Enabled', value: ENABLE_MENTIONS ? 'Yes' : 'No', inline: true }
+        );
 
         message.channel.send({ embeds: [embed] });
     }
 });
 
-// === Run Bot ===
-client.login(DISCORD_TOKEN).catch(err => console.error('🛑 Bot failed to start:', err));
+process.on('SIGINT', async () => {
+    console.log('\n Shutting down, bye-byee...');
+    if (ENABLE_DATABASE) {
+        await closeDatabase();
+    }
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    console.log('\n Shutting down, bye-byee...');
+    if (ENABLE_DATABASE) {
+        await closeDatabase();
+    }
+    process.exit(0);
+});
+
+client.login(DISCORD_TOKEN).catch(err => {
+    console.error(' Bot failed to start:', err);
+    process.exit(1);
+});
